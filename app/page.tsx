@@ -39,7 +39,7 @@ const NetSpector = () => {
 
   const captureInterval = useRef<NodeJS.Timeout | null>(null);
   const packetId = useRef(1);
-  const listEndRef = useRef<HTMLDivElement>(null);
+  const listEndRef = useRef<HTMLTableRowElement | null>(null);
   const listContainerRef = useRef<HTMLDivElement>(null);
   const startTimeRef = useRef<number | null>(null);
 
@@ -72,7 +72,9 @@ const NetSpector = () => {
       }
     `;
     document.head.appendChild(style);
-    return () => document.head.removeChild(style);
+    return () => {
+      if (style.parentNode) style.parentNode.removeChild(style);
+    };
   }, []);
 
   const generatePacket = () => {
@@ -536,8 +538,8 @@ const NetSpector = () => {
             </div>
             <h4 className="font-semibold mb-3">Protocol Distribution</h4>
             <div className="space-y-2">
-              {Object.entries(stats.protocols)
-                .sort((a, b) => b[1] - a[1])
+              {Object.entries(stats.protocols as Record<string, number>)
+                .sort((a, b) => (b[1] as number) - (a[1] as number))
                 .map(([protocol, count]) => {
                   const pct = (
                     (count / Math.max(stats.total, 1)) *
