@@ -17,6 +17,8 @@ import {
   Info,
   Database,
   Clock,
+  Package,
+  ArrowRight,
 } from "lucide-react";
 
 const NetSpector = () => {
@@ -31,6 +33,10 @@ const NetSpector = () => {
   const [maxPackets, setMaxPackets] = useState(1000);
   const [networkInterface, setNetworkInterface] = useState("eth0");
   const [promiscuousMode, setPromiscuousMode] = useState(false);
+  const [useLiveCapture, setUseLiveCapture] = useState(false);
+  const [captureServerUrl, setCaptureServerUrl] = useState(
+    "http://localhost:4000"
+  );
   const [autoScroll, setAutoScroll] = useState(true);
   const [showWelcome, setShowWelcome] = useState(true);
   const [startTime, setStartTime] = useState(0);
@@ -42,6 +48,7 @@ const NetSpector = () => {
   const listEndRef = useRef<HTMLTableRowElement | null>(null);
   const listContainerRef = useRef<HTMLDivElement>(null);
   const startTimeRef = useRef<number | null>(null);
+  const eventSourceRef = useRef<EventSource | null>(null);
 
   const protocolColors: Record<string, string> = {
     TCP: "bg-blue-100 text-blue-800 border-blue-300",
@@ -56,6 +63,438 @@ const NetSpector = () => {
     SMTP: "bg-teal-100 text-teal-800 border-teal-300",
     IMAP: "bg-lime-100 text-lime-800 border-lime-300",
     POP3: "bg-amber-100 text-amber-800 border-amber-300",
+  };
+
+  const buildDetails = (pkt: any) => {
+    const src = pkt.source || "";
+    const dst = pkt.destination || "";
+    const len = pkt.length || 0;
+    const arrival =
+      pkt.time || (pkt.timestamp ? new Date(pkt.timestamp).toISOString() : "");
+    const proto = pkt.protocol || "";
+    const info = pkt.info || "";
+    const rawDetails = pkt.details || {};
+
+    const details: Record<string, { title: string; fields: string[] }> = {};
+
+    // Parse protocol chain
+    const protoParts = proto.split(":").filter(Boolean);
+
+    // Frame - Always show if we have data
+    const frameFields: string[] = [];
+    if (arrival) frameFields.push(`Arrival Time: ${arrival}`);
+    if (len) frameFields.push(`Frame Length: ${len} bytes`);
+    if (len) frameFields.push(`Capture Length: ${len} bytes`);
+    if (pkt.id) frameFields.push(`Frame Number: ${pkt.id}`);
+    if (proto) frameFields.push(`Protocols in frame: ${proto}`);
+
+    if (frameFields.length > 0) {
+      details.frame = {
+        title: `Frame ${pkt.id || ""}: ${len} bytes on wire`,
+        fields: frameFields,
+      };
+    }
+
+    // Ethernet - Only show if we have ethernet data
+    const ethernetFields: string[] = [];
+
+    if (
+      rawDetails.ethernet?.fields &&
+      Array.isArray(rawDetails.ethernet.fields)
+    ) {
+      ethernetFields.push(...rawDetails.ethernet.fields);
+    } else {
+      if (rawDetails["eth.dst"])
+        ethernetFields.push(`Destination: ${rawDetails["eth.dst"]}`);
+      if (rawDetails["eth.src"])
+        ethernetFields.push(`Source: ${rawDetails["eth.src"]}`);
+    }
+
+    if (protoParts.includes("eth") || protoParts.includes("ethertype")) {
+      if (rawDetails["eth.type"]) {
+        ethernetFields.push(`Type: ${rawDetails["eth.type"]}`);
+      } else if (protoParts[1]) {
+        const etherTypeMap: Record<string, string> = {
+          ipv4: "IPv4 (0x0800)",
+          ip: "IPv4 (0x0800)",
+          ipv6: "IPv6 (0x86dd)",
+          arp: "ARP (0x0806)",
+        };
+        const nextProto = protoParts[1];
+        if (etherTypeMap[nextProto]) {
+          ethernetFields.push(`Type: ${etherTypeMap[nextProto]}`);
+        }
+      }
+    }
+
+    if (ethernetFields.length > 0) {
+      details.ethernet = {
+        title: "Ethernet II",
+        fields: ethernetFields,
+      };
+    }
+
+    // ARP - Only show if ARP is in protocol chain
+    if (protoParts.includes("arp")) {
+      const arpFields: string[] = [];
+
+      if (rawDetails.arp?.fields) {
+        arpFields.push(...rawDetails.arp.fields);
+      } else {
+        arpFields.push(`Hardware type: Ethernet (1)`);
+        arpFields.push(`Protocol type: IPv4 (0x0800)`);
+        arpFields.push(`Hardware size: 6`);
+        arpFields.push(`Protocol size: 4`);
+
+        if (info.includes("Probe")) {
+          arpFields.push(`Opcode: ARP Probe (1)`);
+        } else if (info.includes("Reply")) {
+          arpFields.push(`Opcode: ARP Reply (2)`);
+        } else if (info.includes("Request")) {
+          arpFields.push(`Opcode: ARP Request (1)`);
+        }
+
+        const arpMatch = info.match(/Who has ([\d.]+)\?/);
+        if (arpMatch) arpFields.push(`Target IP address: ${arpMatch[1]}`);
+      }
+
+      if (arpFields.length > 0) {
+        details.arp = {
+          title: "Address Resolution Protocol",
+          fields: arpFields,
+        };
+      }
+    }
+
+    // IPv6 - Only show if IPv6 is in protocol chain
+    if (protoParts.includes("ipv6")) {
+      const ipv6Fields: string[] = [];
+
+      if (rawDetails.ipv6?.fields) {
+        ipv6Fields.push(...rawDetails.ipv6.fields);
+      } else {
+        ipv6Fields.push(`Version: 6`);
+        if (rawDetails["ipv6.tclass"])
+          ipv6Fields.push(`Traffic Class: ${rawDetails["ipv6.tclass"]}`);
+        if (rawDetails["ipv6.flow"])
+          ipv6Fields.push(`Flow Label: ${rawDetails["ipv6.flow"]}`);
+
+        const payloadLen = Math.max(0, len - 40);
+        if (payloadLen > 0)
+          ipv6Fields.push(`Payload Length: ${payloadLen} bytes`);
+
+        if (protoParts.includes("hopopts")) {
+          ipv6Fields.push(`Next Header: Hop-by-Hop Option (0)`);
+        } else if (protoParts.includes("icmpv6")) {
+          ipv6Fields.push(`Next Header: ICMPv6 (58)`);
+        } else if (protoParts.includes("udp")) {
+          ipv6Fields.push(`Next Header: UDP (17)`);
+        } else if (protoParts.includes("tcp")) {
+          ipv6Fields.push(`Next Header: TCP (6)`);
+        }
+
+        if (rawDetails["ipv6.hlim"]) {
+          ipv6Fields.push(`Hop Limit: ${rawDetails["ipv6.hlim"]}`);
+        }
+      }
+
+      if (src) ipv6Fields.push(`Source Address: ${src}`);
+      if (dst) ipv6Fields.push(`Destination Address: ${dst}`);
+
+      if (ipv6Fields.length > 2) {
+        details.ipv6 = {
+          title: "Internet Protocol Version 6",
+          fields: ipv6Fields,
+        };
+      }
+    }
+
+    // IPv4 - Only show if IPv4 is in protocol chain (and not IPv6)
+    if (
+      (protoParts.includes("ip") || protoParts.includes("ipv4")) &&
+      !protoParts.includes("ipv6")
+    ) {
+      const ipv4Fields: string[] = [];
+
+      if (rawDetails.ipv4?.fields) {
+        ipv4Fields.push(...rawDetails.ipv4.fields);
+      } else {
+        ipv4Fields.push(`Version: 4`);
+        if (rawDetails["ip.hdr_len"]) {
+          ipv4Fields.push(`Header Length: ${rawDetails["ip.hdr_len"]}`);
+        } else {
+          ipv4Fields.push(`Header Length: 20 bytes`);
+        }
+
+        const totalLen = rawDetails["ip.len"] || Math.max(0, len - 14);
+        if (totalLen) ipv4Fields.push(`Total Length: ${totalLen}`);
+
+        if (rawDetails["ip.id"])
+          ipv4Fields.push(`Identification: ${rawDetails["ip.id"]}`);
+        if (rawDetails["ip.ttl"])
+          ipv4Fields.push(`Time to Live: ${rawDetails["ip.ttl"]}`);
+        if (rawDetails["ip.proto"])
+          ipv4Fields.push(`Protocol: ${rawDetails["ip.proto"]}`);
+      }
+
+      if (src) ipv4Fields.push(`Source Address: ${src}`);
+      if (dst) ipv4Fields.push(`Destination Address: ${dst}`);
+
+      if (ipv4Fields.length > 0) {
+        details.ipv4 = {
+          title: "Internet Protocol Version 4",
+          fields: ipv4Fields,
+        };
+      }
+    }
+
+    // ICMPv6 - Only show if ICMPv6 is in protocol chain
+    if (protoParts.includes("icmpv6")) {
+      const icmpv6Fields: string[] = [];
+
+      if (rawDetails.icmpv6?.fields) {
+        icmpv6Fields.push(...rawDetails.icmpv6.fields);
+      } else {
+        if (info.includes("Neighbor Solicitation")) {
+          icmpv6Fields.push(`Type: Neighbor Solicitation (135)`);
+          icmpv6Fields.push(`Code: 0`);
+          const nsMatch = info.match(/for ([\da-f:]+)/i);
+          if (nsMatch) icmpv6Fields.push(`Target Address: ${nsMatch[1]}`);
+        } else if (info.includes("Neighbor Advertisement")) {
+          icmpv6Fields.push(`Type: Neighbor Advertisement (136)`);
+          icmpv6Fields.push(`Code: 0`);
+          const naMatch = info.match(/([a-f0-9:]+) \(ovr\) is at ([\da-f:]+)/i);
+          if (naMatch) {
+            icmpv6Fields.push(`Target Address: ${naMatch[1]}`);
+            icmpv6Fields.push(`Target Link-layer Address: ${naMatch[2]}`);
+          }
+        } else if (info.includes("Router Solicitation")) {
+          icmpv6Fields.push(`Type: Router Solicitation (133)`);
+          icmpv6Fields.push(`Code: 0`);
+        } else if (info.includes("Router Advertisement")) {
+          icmpv6Fields.push(`Type: Router Advertisement (134)`);
+          icmpv6Fields.push(`Code: 0`);
+        } else if (info.includes("Multicast Listener Report")) {
+          icmpv6Fields.push(`Type: Multicast Listener Report (143)`);
+          icmpv6Fields.push(`Code: 0`);
+          const mlrMatch = info.match(/v(\d+)/);
+          if (mlrMatch) icmpv6Fields.push(`Version: ${mlrMatch[1]}`);
+        } else if (info.includes("Echo")) {
+          icmpv6Fields.push(
+            `Type: Echo ${info.includes("Reply") ? "Reply" : "Request"} (${
+              info.includes("Reply") ? "129" : "128"
+            })`
+          );
+          icmpv6Fields.push(`Code: 0`);
+        }
+
+        if (rawDetails["icmpv6.checksum"]) {
+          icmpv6Fields.push(`Checksum: ${rawDetails["icmpv6.checksum"]}`);
+        }
+      }
+
+      if (icmpv6Fields.length > 0) {
+        details.icmpv6 = {
+          title: "Internet Control Message Protocol v6",
+          fields: icmpv6Fields,
+        };
+      }
+    }
+
+    // TCP - Only show if TCP is in protocol chain
+    if (protoParts.includes("tcp")) {
+      const tcpFields: string[] = [];
+
+      if (rawDetails.tcp?.fields) {
+        tcpFields.push(...rawDetails.tcp.fields);
+      } else {
+        // Parse from info field if available
+        const portMatch = info.match(/(\d+)\s*(?:→|â†'|->|\u2192)\s*(\d+)/);
+        if (portMatch) {
+          tcpFields.push(`Source Port: ${portMatch[1]}`);
+          tcpFields.push(`Destination Port: ${portMatch[2]}`);
+        } else if (rawDetails["tcp.srcport"]) {
+          tcpFields.push(`Source Port: ${rawDetails["tcp.srcport"]}`);
+          tcpFields.push(`Destination Port: ${rawDetails["tcp.dstport"]}`);
+        }
+
+        if (rawDetails["tcp.seq"])
+          tcpFields.push(`Sequence Number: ${rawDetails["tcp.seq"]}`);
+        if (rawDetails["tcp.ack"])
+          tcpFields.push(`Acknowledgment Number: ${rawDetails["tcp.ack"]}`);
+        if (rawDetails["tcp.hdr_len"])
+          tcpFields.push(`Header Length: ${rawDetails["tcp.hdr_len"]}`);
+
+        const flagsMatch = info.match(/\[(.*?)\]/);
+        if (flagsMatch) {
+          tcpFields.push(`Flags: ${flagsMatch[1]}`);
+        } else if (rawDetails["tcp.flags"]) {
+          tcpFields.push(`Flags: ${rawDetails["tcp.flags"]}`);
+        }
+
+        if (rawDetails["tcp.window_size"])
+          tcpFields.push(`Window Size: ${rawDetails["tcp.window_size"]}`);
+        if (rawDetails["tcp.checksum"])
+          tcpFields.push(`Checksum: ${rawDetails["tcp.checksum"]}`);
+        if (rawDetails["tcp.urgent_pointer"])
+          tcpFields.push(`Urgent Pointer: ${rawDetails["tcp.urgent_pointer"]}`);
+      }
+
+      if (tcpFields.length > 0) {
+        details.tcp = {
+          title: "Transmission Control Protocol",
+          fields: tcpFields,
+        };
+      }
+    }
+
+    // UDP - Only show if UDP is in protocol chain
+    if (protoParts.includes("udp")) {
+      const udpFields: string[] = [];
+
+      if (rawDetails.udp?.fields) {
+        udpFields.push(...rawDetails.udp.fields);
+      } else {
+        if (rawDetails["udp.srcport"]) {
+          udpFields.push(`Source Port: ${rawDetails["udp.srcport"]}`);
+          udpFields.push(`Destination Port: ${rawDetails["udp.dstport"]}`);
+        }
+
+        if (rawDetails["udp.length"]) {
+          udpFields.push(`Length: ${rawDetails["udp.length"]}`);
+        } else {
+          udpFields.push(`Length: ${len}`);
+        }
+
+        if (rawDetails["udp.checksum"])
+          udpFields.push(`Checksum: ${rawDetails["udp.checksum"]}`);
+      }
+
+      if (udpFields.length > 0) {
+        details.udp = {
+          title: "User Datagram Protocol",
+          fields: udpFields,
+        };
+      }
+    }
+
+    // LLMNR - Only show if present
+    if (protoParts.includes("llmnr")) {
+      const llmnrFields: string[] = [];
+
+      if (rawDetails.llmnr?.fields) {
+        llmnrFields.push(...rawDetails.llmnr.fields);
+      } else {
+        const txIdMatch = info.match(/0x[0-9a-f]+/i);
+        if (txIdMatch) llmnrFields.push(`Transaction ID: ${txIdMatch[0]}`);
+
+        llmnrFields.push(`Flags: Standard Query`);
+
+        const queryMatch = info.match(/ANY\s+(\S+)/i);
+        if (queryMatch) {
+          llmnrFields.push(`Queries: ${queryMatch[1]}`);
+          llmnrFields.push(`Query Type: ANY`);
+        }
+      }
+
+      if (llmnrFields.length > 0) {
+        details.llmnr = {
+          title: "Link-Local Multicast Name Resolution",
+          fields: llmnrFields,
+        };
+      }
+    }
+
+    // mDNS - Only show if present
+    if (protoParts.includes("mdns")) {
+      const mdnsFields: string[] = [];
+
+      if (rawDetails.mdns?.fields) {
+        mdnsFields.push(...rawDetails.mdns.fields);
+      } else {
+        const txIdMatch = info.match(/0x[0-9a-f]+/i);
+        if (txIdMatch) mdnsFields.push(`Transaction ID: ${txIdMatch[0]}`);
+
+        mdnsFields.push(`Flags: Standard Query`);
+
+        const queryMatch = info.match(/ANY\s+([^,]+)/);
+        if (queryMatch) {
+          mdnsFields.push(`Query: ${queryMatch[1]}`);
+          mdnsFields.push(`Query Type: ANY (255)`);
+        }
+
+        if (info.includes('"QU"')) {
+          mdnsFields.push(`QU Flag: Set (Unicast response requested)`);
+        }
+      }
+
+      if (mdnsFields.length > 0) {
+        details.mdns = {
+          title: "Multicast DNS",
+          fields: mdnsFields,
+        };
+      }
+    }
+
+    // DNS - Only show if present
+    if (protoParts.includes("dns") && rawDetails.dns?.fields) {
+      details.dns = {
+        title: rawDetails.dns.title || "DNS",
+        fields: rawDetails.dns.fields,
+      };
+    }
+
+    // HTTP/HTTPS - Only show if present
+    if (protoParts.includes("http") || protoParts.includes("https")) {
+      const appFields: string[] = [];
+
+      if (rawDetails.http?.fields) {
+        appFields.push(...rawDetails.http.fields);
+      } else {
+        const methodMatch = info.match(
+          /^(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+(.+?)\s/i
+        );
+        if (methodMatch) {
+          appFields.push(`Request Method: ${methodMatch[1]}`);
+          appFields.push(`Request URI: ${methodMatch[2]}`);
+        }
+
+        if (info.includes("Host:")) {
+          const hostMatch = info.match(/Host:\s*([^\s,]+)/i);
+          if (hostMatch) appFields.push(`Host: ${hostMatch[1]}`);
+        }
+      }
+
+      if (appFields.length > 0) {
+        const title = protoParts.includes("https")
+          ? "HTTPS Request"
+          : "HTTP Request";
+        details.application = {
+          title: title,
+          fields: appFields,
+        };
+      }
+    }
+
+    // Generic Application Data - Only show if present
+    if (rawDetails.application?.fields && !details.application) {
+      details.application = {
+        title: rawDetails.application.title || "Application Data",
+        fields: rawDetails.application.fields,
+      };
+    }
+
+    return details;
+  };
+
+  const getPrimaryProtocol = (p: string | undefined) => {
+    if (!p) return "";
+    const parts = String(p)
+      .split(/[:\s,]+/)
+      .filter(Boolean);
+    return parts.length
+      ? parts[parts.length - 1].toUpperCase()
+      : p.toUpperCase();
   };
 
   useEffect(() => {
@@ -77,205 +516,20 @@ const NetSpector = () => {
     };
   }, []);
 
-  const generatePacket = () => {
-    const protocols = [
-      "TCP",
-      "UDP",
-      "HTTP",
-      "DNS",
-      "ARP",
-      "ICMP",
-      "HTTPS",
-      "SSH",
-      "FTP",
-      "SMTP",
-      "IMAP",
-      "POP3",
-    ];
-    const protocol = protocols[Math.floor(Math.random() * protocols.length)];
-
-    const sourceIP = promiscuousMode
-      ? `${Math.floor(Math.random() * 223) + 1}.${Math.floor(
-          Math.random() * 255
-        )}.${Math.floor(Math.random() * 255)}.${Math.floor(
-          Math.random() * 255
-        )}`
-      : `192.168.1.${Math.floor(Math.random() * 254) + 1}`;
-
-    const destIPs = [
-      "8.8.8.8",
-      "1.1.1.1",
-      "192.168.1.1",
-      "10.0.0.1",
-      "142.250.190.14",
-      "13.107.42.14",
-    ];
-    const destIP = destIPs[Math.floor(Math.random() * destIPs.length)];
-
-    const length = Math.floor(Math.random() * 1446) + 54;
-
-    const relativeTime = startTimeRef.current
-      ? ((Date.now() - startTimeRef.current) / 1000).toFixed(6)
-      : "0.000000";
-
-    const bytes = Array.from({ length }, () => Math.floor(Math.random() * 256));
-    const hexData: string[] = [];
-    for (let i = 0; i < length; i += 16) {
-      const lineBytes = bytes.slice(i, i + 16);
-      const hex = lineBytes
-        .map((b) => b.toString(16).padStart(2, "0"))
-        .join(" ");
-      hexData.push(hex.padEnd(47, " "));
+  // No dummy packet generation: UI maps real capture JSON provided by the capture server.
+  // Helper to convert raw hex string into 16-byte lines for the hex viewer.
+  const convertRawToLines = (raw: string) => {
+    if (!raw) return [];
+    const cleaned = String(raw).replace(/\s+/g, "");
+    const bytes: string[] = [];
+    for (let i = 0; i < cleaned.length; i += 2) {
+      bytes.push(cleaned.substr(i, 2));
     }
-
-    const details = generateProtocolDetails(protocol, sourceIP, destIP, length);
-
-    return {
-      id: packetId.current++,
-      time: relativeTime,
-      timestamp: Date.now(),
-      source: sourceIP,
-      destination: destIP,
-      protocol,
-      length,
-      info: generateInfo(protocol),
-      hexData,
-      details,
-    };
-  };
-
-  const generateFlags = (protocol: string) => {
-    if (protocol === "TCP") {
-      const flags = ["SYN", "ACK", "PSH", "FIN", "RST", "URG"];
-      return flags[Math.floor(Math.random() * flags.length)];
+    const lines: string[] = [];
+    for (let i = 0; i < bytes.length; i += 16) {
+      lines.push(bytes.slice(i, i + 16).join(" "));
     }
-    return null;
-  };
-
-  const generateProtocolDetails = (
-    protocol: string,
-    src: string,
-    dst: string,
-    len: number
-  ) => {
-    const macSrc = Array(6)
-      .fill(0)
-      .map(() =>
-        Math.floor(Math.random() * 256)
-          .toString(16)
-          .padStart(2, "0")
-      )
-      .join(":");
-    const macDst = Array(6)
-      .fill(0)
-      .map(() =>
-        Math.floor(Math.random() * 256)
-          .toString(16)
-          .padStart(2, "0")
-      )
-      .join(":");
-
-    const now = new Date();
-    const arrivalTime =
-      now.toLocaleString("en-US", { hour12: false }) +
-      `.${now.getMilliseconds().toString().padStart(3, "0")}`;
-
-    const details: Record<string, { title: string; fields: string[] }> = {
-      frame: {
-        title: `Frame ${packetId.current}: ${len} bytes on wire`,
-        fields: [
-          `Arrival Time: ${arrivalTime}`,
-          `Frame Length: ${len} bytes`,
-          `Capture Length: ${len} bytes`,
-          `Frame Number: ${packetId.current}`,
-          "Protocols in frame: eth:ip:tcp",
-        ],
-      },
-      ethernet: {
-        title: "Ethernet II",
-        fields: [
-          `Destination: ${macDst}`,
-          `Source: ${macSrc}`,
-          "Type: IPv4 (0x0800)",
-        ],
-      },
-      ipv4: {
-        title: "Internet Protocol Version 4",
-        fields: [
-          "Version: 4",
-          "Header Length: 20 bytes",
-          "Total Length: " + (len - 14),
-          "Identification: 0x" + Math.floor(Math.random() * 65535).toString(16),
-          "Time to Live: " + Math.floor(Math.random() * 128 + 64),
-          "Protocol: " + protocol,
-          "Source Address: " + src,
-          "Destination Address: " + dst,
-        ],
-      },
-    };
-
-    if (
-      ["TCP", "HTTP", "HTTPS", "SSH", "FTP", "SMTP", "IMAP", "POP3"].includes(
-        protocol
-      )
-    ) {
-      details.tcp = {
-        title: "Transmission Control Protocol",
-        fields: [
-          "Source Port: " + Math.floor(Math.random() * 40000 + 1024),
-          "Destination Port: " +
-            [80, 443, 22, 21, 25, 143, 110][Math.floor(Math.random() * 7)],
-          "Sequence Number: " + Math.floor(Math.random() * 4294967295),
-          "Acknowledgment Number: " + Math.floor(Math.random() * 4294967295),
-          "Flags: 0x018 (PSH, ACK)",
-          "Window Size: " + Math.floor(Math.random() * 65535),
-        ],
-      };
-    } else if (protocol === "UDP" || protocol === "DNS") {
-      details.udp = {
-        title: "User Datagram Protocol",
-        fields: [
-          "Source Port: " + Math.floor(Math.random() * 65535),
-          "Destination Port: " + [53, 123][Math.floor(Math.random() * 2)],
-          "Length: " + (len - 34),
-        ],
-      };
-    }
-
-    if (protocol === "HTTP" || protocol === "HTTPS") {
-      details.application = {
-        title: protocol + " Request",
-        fields: [
-          "Request Method: " + ["GET", "POST"][Math.floor(Math.random() * 2)],
-          "Request URI: /" +
-            ["", "api/data", "login"][Math.floor(Math.random() * 3)],
-          "Host: " + dst,
-        ],
-      };
-    }
-
-    return details;
-  };
-
-  const generateInfo = (protocol: string) => {
-    const infos: Record<string, string[]> = {
-      TCP: ["[SYN]", "[SYN, ACK]", "[ACK]", "[PSH, ACK]", "[FIN, ACK]"],
-      UDP: ["DNS Query", "NTP Request"],
-      HTTP: ["GET / HTTP/1.1", "POST /login"],
-      DNS: ["Standard query A example.com"],
-      ARP: ["Who has 192.168.1.1?"],
-      ICMP: ["Echo (ping) request"],
-      HTTPS: ["Application Data", "Client Hello"],
-      SSH: ["SSH-2.0-OpenSSH"],
-      FTP: ["USER anonymous"],
-      SMTP: ["EHLO mail.example.com"],
-      IMAP: ["LOGIN user pass"],
-      POP3: ["STAT"],
-    };
-    return (
-      infos[protocol]?.[Math.floor(Math.random() * infos[protocol].length)] ||
-      "Data"
-    );
+    return lines;
   };
 
   const startCapture = () => {
@@ -285,20 +539,77 @@ const NetSpector = () => {
     const now = Date.now();
     setStartTime(now);
     startTimeRef.current = now;
-    captureInterval.current = setInterval(() => {
-      const packet = generatePacket();
-      setPackets((prev) => {
-        const next = [...prev, packet];
-        if (next.length > maxPackets) return next.slice(-maxPackets);
-        return next;
-      });
-    }, captureSpeed);
+
+    if (useLiveCapture) {
+      try {
+        const url = captureServerUrl.replace(/\/+$/, "") + "/events";
+        const es = new EventSource(url);
+        eventSourceRef.current = es;
+        es.onmessage = (ev) => {
+          try {
+            const data = JSON.parse(ev.data);
+            if (data.error) {
+              console.error("capture server error:", data.error);
+              return;
+            }
+            const raw = data.raw || "";
+            const lengthFromRaw = raw
+              ? Math.ceil(raw.replace(/\s+/g, "").length / 2)
+              : 0;
+            const proto = getPrimaryProtocol(data.protocol || "");
+            const pkt = {
+              id: data.id != null ? Number(data.id) : packetId.current++,
+              time:
+                data.time ||
+                (startTimeRef.current
+                  ? ((Date.now() - startTimeRef.current) / 1000).toFixed(6)
+                  : "0.000000"),
+              timestamp: data.timestamp || Date.now(),
+              source: data.source || data.src || "",
+              destination: data.destination || data.dst || "",
+              protocol: proto || (raw ? "RAW" : ""),
+              length: data.length || lengthFromRaw || 0,
+              info: data.info || "",
+              hexData:
+                data.hexData && data.hexData.length
+                  ? data.hexData
+                  : convertRawToLines(raw),
+              raw: raw,
+              details: data.details || {},
+            };
+            setPackets((prev) => {
+              const next = [...prev, pkt];
+              if (next.length > maxPackets) return next.slice(-maxPackets);
+              return next;
+            });
+          } catch (e) {
+            console.error("Failed to parse capture event", e);
+          }
+        };
+        es.onerror = (e) => {
+          console.error("EventSource error", e);
+        };
+      } catch (e) {
+        console.error("Failed to open EventSource", e);
+        setCapturing(false);
+      }
+    } else {
+      // No dummy/simulated data: when live capture is disabled, do not generate packets.
+      // User should enable 'Use Live Capture' and point to a running capture server.
+      console.warn(
+        "Live capture is disabled — enable Use Live Capture to receive packets."
+      );
+    }
   };
 
   const stopCapture = () => {
     setCapturing(false);
     setPaused(false);
     if (captureInterval.current) clearInterval(captureInterval.current);
+    if (eventSourceRef.current) {
+      eventSourceRef.current.close();
+      eventSourceRef.current = null;
+    }
   };
 
   const pauseCapture = () => {
@@ -306,7 +617,10 @@ const NetSpector = () => {
       startCapture(); // reuse logic
       setPaused(false);
     } else {
-      if (captureInterval.current) clearInterval(captureInterval.current);
+      if (eventSourceRef.current) {
+        eventSourceRef.current.close();
+        eventSourceRef.current = null;
+      }
       setPaused(true);
     }
   };
@@ -366,6 +680,12 @@ const NetSpector = () => {
   useEffect(() => {
     return () => {
       if (captureInterval.current) clearInterval(captureInterval.current);
+      if (eventSourceRef.current) {
+        try {
+          eventSourceRef.current.close();
+        } catch (e) {}
+        eventSourceRef.current = null;
+      }
     };
   }, []);
 
@@ -388,6 +708,8 @@ const NetSpector = () => {
       : "0.0",
   };
 
+  const detailsForRender = selectedPacket ? buildDetails(selectedPacket) : {};
+
   return (
     <div className="h-screen flex flex-col bg-gradient-to-br from-gray-50 to-gray-100">
       {/* Welcome Modal */}
@@ -399,12 +721,12 @@ const NetSpector = () => {
               <h2 className="text-3xl font-bold">NetSpector</h2>
             </div>
             <p className="text-lg mb-6">
-              Browser-based Wireshark-like Network Analyzer (Simulation)
+              Browser-based Wireshark-like Network Analyzer
             </p>
             <div className="bg-blue-50 p-4 rounded mb-6">
               <p className="text-sm">
-                This is a <strong>simulation</strong> for educational purposes.
-                Real packet capture requires native tools.
+                To receive real packets enable <strong>Use Live Capture</strong>{" "}
+                and run the local capture server (tshark).
               </p>
             </div>
             <button
@@ -447,6 +769,27 @@ const NetSpector = () => {
                   <option value="wlan0">WiFi (wlan0)</option>
                   <option value="lo">Loopback (lo)</option>
                 </select>
+              </div>
+              <div className="flex items-center justify-between mt-3">
+                <label className="text-sm font-semibold">
+                  Use Live Capture (local)
+                </label>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="text"
+                    value={captureServerUrl}
+                    onChange={(e) => setCaptureServerUrl(e.target.value)}
+                    className="border rounded px-2 py-1 w-48"
+                  />
+                  <button
+                    onClick={() => setUseLiveCapture(!useLiveCapture)}
+                    className={`px-3 py-1 rounded ${
+                      useLiveCapture ? "bg-green-500 text-white" : "bg-gray-200"
+                    }`}
+                  >
+                    {useLiveCapture ? "ON" : "OFF"}
+                  </button>
+                </div>
               </div>
               <div>
                 <label className="block text-sm font-semibold mb-2">
@@ -799,59 +1142,129 @@ const NetSpector = () => {
         {/* Bottom Panel: Details (2/3) + Hex (1/3) */}
         <div className="flex flex-1 min-h-0 bg-gray-50 border-t">
           {/* Packet Details - 2/3 */}
-          <div className="w-2/3 overflow-auto bg-white border-r">
+          <div className="w-2/3 min-w-0 overflow-y-auto bg-white border-r flex-shrink-0">
             {selectedPacket ? (
               <div className="p-6">
-                <h3 className="text-xl font-bold mb-5 flex items-center gap-3">
-                  <Info className="w-6 h-6 text-blue-600" />
-                  Packet Details #{selectedPacket.id}
-                </h3>
-                {Object.entries(selectedPacket.details).map(
-                  ([key, section]: [string, any]) => (
-                    <details
-                      key={key}
-                      open
-                      className="mb-4 border rounded-lg shadow-sm"
+                {/* Header */}
+                <div className="mb-5">
+                  <h3 className="text-lg font-bold flex items-center gap-2">
+                    <Info className="w-5 h-5 text-blue-600" />
+                    Packet Details #{selectedPacket.id}
+                  </h3>
+
+                  <div className="mt-3 grid grid-cols-1 lg:grid-cols-2 gap-4">
+                    {/* Source → Destination */}
+                    <div className="flex flex-wrap items-center gap-3 text-sm">
+                      <span className="font-mono text-gray-600">
+                        {selectedPacket.time}s
+                      </span>
+
+                      <span className="font-mono text-blue-700">
+                        {selectedPacket.source}
+                      </span>
+
+                      <span className="text-gray-400">→</span>
+
+                      <span className="font-mono text-green-700">
+                        {selectedPacket.destination}
+                      </span>
+                    </div>
+
+                    {/* Meta Info */}
+                    <div className="flex flex-wrap items-center gap-3 lg:justify-end text-sm">
+                      <span
+                        className={`px-2 py-1 rounded text-xs font-semibold border ${
+                          protocolColors?.[selectedPacket.protocol] ??
+                          "bg-gray-200 text-gray-700"
+                        }`}
+                      >
+                        {selectedPacket.protocol}
+                      </span>
+
+                      <span className="text-gray-600">
+                        {selectedPacket.length} bytes
+                      </span>
+
+                      <span className="text-gray-500 truncate max-w-xs">
+                        {selectedPacket.info}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Protocol Details */}
+                <div className="mt-4">
+                  {Object.keys(detailsForRender ?? {}).length > 0 ? (
+                    <div
+                      className="space-y-3"
+                      style={{ overflowAnchor: "none" }}
                     >
-                      <summary className="cursor-pointer font-semibold py-3 px-5 bg-blue-50 hover:bg-blue-100 flex items-center gap-3">
-                        <span className="text-blue-600 text-lg">▶</span>
-                        {section.title}
-                      </summary>
-                      <div className="p-5 bg-gray-50 border-t">
-                        {section.fields.map((field: string, i: number) => {
-                          const parts = field.split(": ");
-                          return parts.length >= 2 ? (
-                            <div key={i} className="py-1.5 text-sm">
-                              <span className="font-medium text-gray-800">
-                                {parts[0]}:
-                              </span>
-                              <span className="ml-4 font-mono text-blue-700">
-                                {parts.slice(1).join(": ")}
-                              </span>
+                      {Object.entries(detailsForRender).map(
+                        ([key, section]) => (
+                          <details key={key} className="border rounded">
+                            <summary className="px-4 py-2 bg-gray-100 cursor-pointer font-semibold flex justify-between items-center">
+                              <span>{section.title}</span>
+
+                              {Array.isArray(section.fields) && (
+                                <span className="text-xs text-gray-500">
+                                  {section.fields.length} fields
+                                </span>
+                              )}
+                            </summary>
+
+                            <div className="p-4 bg-white text-sm">
+                              <div className="space-y-1">
+                                {Array.isArray(section.fields) &&
+                                  section.fields.map((field, i) => {
+                                    const [label, ...rest] = field.split(": ");
+
+                                    return rest.length ? (
+                                      <div
+                                        key={i}
+                                        className="flex justify-between gap-4"
+                                      >
+                                        <span className="text-gray-700 font-medium">
+                                          {label}
+                                        </span>
+                                        <span className="font-mono text-blue-700 text-right">
+                                          {rest.join(": ")}
+                                        </span>
+                                      </div>
+                                    ) : (
+                                      <div
+                                        key={i}
+                                        className="font-mono text-gray-700"
+                                      >
+                                        {field}
+                                      </div>
+                                    );
+                                  })}
+                              </div>
                             </div>
-                          ) : (
-                            <div key={i} className="py-1.5 text-sm font-mono">
-                              {field}
-                            </div>
-                          );
-                        })}
-                      </div>
-                    </details>
-                  )
-                )}
+                          </details>
+                        )
+                      )}
+                    </div>
+                  ) : (
+                    <div className="p-4 bg-gray-50 rounded border text-sm text-gray-600">
+                      No parsed details available for this packet.
+                    </div>
+                  )}
+                </div>
               </div>
             ) : (
+              /* Empty State */
               <div className="flex items-center justify-center h-full text-gray-400">
                 <div className="text-center">
-                  <Info className="w-20 h-20 mx-auto mb-4" />
-                  <p className="text-xl">Select a packet to view details</p>
+                  <Info className="w-16 h-16 mx-auto mb-3 opacity-60" />
+                  <p className="text-lg">Select a packet to view details</p>
                 </div>
               </div>
             )}
           </div>
 
           {/* Hex Dump - 1/3 */}
-          <div className="w-1/3 overflow-auto bg-gray-900 text-green-400 font-mono text-xs">
+          <div className="w-1/3 overflow-auto bg-gray-900 text-green-400 font-mono text-xs flex-shrink-0 min-w-0">
             {selectedPacket ? (
               <div className="p-5">
                 <div className="text-white mb-4 flex items-center gap-3">
@@ -860,7 +1273,10 @@ const NetSpector = () => {
                     Hex View ({selectedPacket.length} bytes)
                   </span>
                 </div>
-                {selectedPacket.hexData.map((line: string, idx: number) => (
+                {(selectedPacket.hexData && selectedPacket.hexData.length > 0
+                  ? selectedPacket.hexData
+                  : convertRawToLines(selectedPacket.raw)
+                ).map((line: string, idx: number) => (
                   <div
                     key={idx}
                     className="hover:bg-gray-800 py-1 px-3 rounded"

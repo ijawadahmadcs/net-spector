@@ -6,7 +6,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "capture": "node capture-server.js"
   },
   "dependencies": {
     "lucide-react": "^0.561.0",
