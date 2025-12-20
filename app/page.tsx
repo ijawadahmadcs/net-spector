@@ -13,12 +13,8 @@ import {
   Settings,
   BarChart3,
   Network,
-  AlertCircle,
   Info,
   Database,
-  Clock,
-  Package,
-  ArrowRight,
 } from "lucide-react";
 
 const NetSpector = () => {
@@ -42,6 +38,8 @@ const NetSpector = () => {
   const [startTime, setStartTime] = useState(0);
   const [capturing, setCapturing] = useState(false);
   const [paused, setPaused] = useState(false);
+  const [expandAll, setExpandAll] = useState(false);
+  const [showRawJson, setShowRawJson] = useState(false);
 
   const captureInterval = useRef<NodeJS.Timeout | null>(null);
   const packetId = useRef(1);
@@ -80,19 +78,26 @@ const NetSpector = () => {
     // Parse protocol chain
     const protoParts = proto.split(":").filter(Boolean);
 
-    // Frame - Always show if we have data
-    const frameFields: string[] = [];
-    if (arrival) frameFields.push(`Arrival Time: ${arrival}`);
-    if (len) frameFields.push(`Frame Length: ${len} bytes`);
-    if (len) frameFields.push(`Capture Length: ${len} bytes`);
-    if (pkt.id) frameFields.push(`Frame Number: ${pkt.id}`);
-    if (proto) frameFields.push(`Protocols in frame: ${proto}`);
-
-    if (frameFields.length > 0) {
+    // Frame - Prefer server-provided details if available
+    if (rawDetails.frame?.fields && Array.isArray(rawDetails.frame.fields)) {
       details.frame = {
-        title: `Frame ${pkt.id || ""}: ${len} bytes on wire`,
-        fields: frameFields,
+        title: rawDetails.frame.title || `${pkt.id || ""} ${len} `,
+        fields: rawDetails.frame.fields,
       };
+    } else {
+      const frameFields: string[] = [];
+      if (arrival) frameFields.push(`Arrival Time: ${arrival}`);
+      if (len) frameFields.push(`Frame Length: ${len} bytes`);
+      if (len) frameFields.push(`Capture Length: ${len} bytes`);
+      if (pkt.id) frameFields.push(`Frame Number: ${pkt.id}`);
+      if (proto) frameFields.push(`Protocols in frame: ${proto}`);
+
+      if (frameFields.length > 0) {
+        details.frame = {
+          title: `${pkt.id || ""} ${len} `,
+          fields: frameFields,
+        };
+      }
     }
 
     // Ethernet - Only show if we have ethernet data
@@ -129,7 +134,7 @@ const NetSpector = () => {
 
     if (ethernetFields.length > 0) {
       details.ethernet = {
-        title: "Ethernet II",
+        title: rawDetails.ethernet?.title || "",
         fields: ethernetFields,
       };
     }
@@ -203,7 +208,7 @@ const NetSpector = () => {
 
       if (ipv6Fields.length > 2) {
         details.ipv6 = {
-          title: "Internet Protocol Version 6",
+          title: rawDetails.ipv6?.title || "Internet Protocol Version 6",
           fields: ipv6Fields,
         };
       }
@@ -242,7 +247,7 @@ const NetSpector = () => {
 
       if (ipv4Fields.length > 0) {
         details.ipv4 = {
-          title: "Internet Protocol Version 4",
+          title: rawDetails.ipv4?.title || "Internet Protocol Version 4",
           fields: ipv4Fields,
         };
       }
@@ -295,7 +300,8 @@ const NetSpector = () => {
 
       if (icmpv6Fields.length > 0) {
         details.icmpv6 = {
-          title: "Internet Control Message Protocol v6",
+          title:
+            rawDetails.icmpv6?.title || "Internet Control Message Protocol v6",
           fields: icmpv6Fields,
         };
       }
@@ -342,7 +348,7 @@ const NetSpector = () => {
 
       if (tcpFields.length > 0) {
         details.tcp = {
-          title: "Transmission Control Protocol",
+          title: rawDetails.tcp?.title || "Transmission Control Protocol",
           fields: tcpFields,
         };
       }
@@ -372,7 +378,7 @@ const NetSpector = () => {
 
       if (udpFields.length > 0) {
         details.udp = {
-          title: "User Datagram Protocol",
+          title: rawDetails.udp?.title || "User Datagram Protocol",
           fields: udpFields,
         };
       }
@@ -436,8 +442,11 @@ const NetSpector = () => {
       }
     }
 
-    // DNS - Only show if present
-    if (protoParts.includes("dns") && rawDetails.dns?.fields) {
+    // DNS - Show if present (prefer provided title/fields)
+    if (
+      (protoParts.includes("dns") || rawDetails.dns?.fields) &&
+      rawDetails.dns?.fields
+    ) {
       details.dns = {
         title: rawDetails.dns.title || "DNS",
         fields: rawDetails.dns.fields,
@@ -490,26 +499,56 @@ const NetSpector = () => {
   const getPrimaryProtocol = (p: string | undefined) => {
     if (!p) return "";
     const parts = String(p)
+      .toLowerCase()
       .split(/[:\s,]+/)
       .filter(Boolean);
-    return parts.length
-      ? parts[parts.length - 1].toUpperCase()
-      : p.toUpperCase();
+
+    const preferredOrder = [
+      "http",
+      "https",
+      "dns",
+      "tcp",
+      "udp",
+      "icmp",
+      "icmpv6",
+      "ipv4",
+      "ip",
+      "ipv6",
+      "arp",
+      "mdns",
+      "llmnr",
+    ];
+
+    for (const proto of preferredOrder) {
+      if (parts.includes(proto)) return proto.toUpperCase();
+    }
+
+    // Fallback: pick the last meaningful part (ignore generic 'data')
+    const last = [...parts].reverse().find((x) => x !== "data");
+    return (last || parts[parts.length - 1] || p).toUpperCase();
+  };
+
+  const copyText = async (text: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch (e) {
+      console.warn("Clipboard copy failed", e);
+    }
   };
 
   useEffect(() => {
     const style = document.createElement("style");
     style.textContent = `
-      details > summary { list-style: none; }
-      details > summary::-webkit-details-marker { display: none; }
-      details > summary > span:first-child {
-        transition: transform 0.2s;
-        display: inline-block;
-      }
-      details[open] > summary > span:first-child {
-        transform: rotate(90deg);
-      }
-    `;
+        details > summary { list-style: none; }
+        details > summary::-webkit-details-marker { display: none; }
+        details > summary > span:first-child {
+          transition: transform 0.2s;
+          display: inline-block;
+        }
+        details[open] > summary > span:first-child {
+          transform: rotate(90deg);
+        }
+      `;
     document.head.appendChild(style);
     return () => {
       if (style.parentNode) style.parentNode.removeChild(style);
@@ -518,12 +557,51 @@ const NetSpector = () => {
 
   // No dummy packet generation: UI maps real capture JSON provided by the capture server.
   // Helper to convert raw hex string into 16-byte lines for the hex viewer.
-  const convertRawToLines = (raw: string) => {
-    if (!raw) return [];
-    const cleaned = String(raw).replace(/\s+/g, "");
+  const toHexFromUnknown = (raw: any): string => {
+    try {
+      if (!raw) return "";
+
+      // Array of byte numbers
+      if (Array.isArray(raw)) {
+        return raw
+          .map((b) => {
+            const n = Number(b) & 0xff;
+            return n.toString(16).padStart(2, "0");
+          })
+          .join("");
+      }
+
+      const s = String(raw).trim();
+
+      // Try base64 heuristic
+      const looksBase64 =
+        /^[A-Za-z0-9+/=]+$/.test(s) && s.length % 4 === 0 && /[+/=]/.test(s);
+      if (looksBase64) {
+        try {
+          const bin = atob(s);
+          let hex = "";
+          for (let i = 0; i < bin.length; i++) {
+            hex += bin.charCodeAt(i).toString(16).padStart(2, "0");
+          }
+          if (hex) return hex;
+        } catch (_) {
+          // fallthrough to hex-only cleanup
+        }
+      }
+
+      // Remove all non-hex chars (handles spaces, colons, newlines)
+      return s.replace(/[^0-9a-fA-F]/g, "");
+    } catch {
+      return "";
+    }
+  };
+
+  const convertRawToLines = (raw: any) => {
+    const hex = toHexFromUnknown(raw);
+    if (!hex) return [];
     const bytes: string[] = [];
-    for (let i = 0; i < cleaned.length; i += 2) {
-      bytes.push(cleaned.substr(i, 2));
+    for (let i = 0; i < hex.length; i += 2) {
+      bytes.push(hex.substr(i, 2));
     }
     const lines: string[] = [];
     for (let i = 0; i < bytes.length; i += 16) {
@@ -552,10 +630,11 @@ const NetSpector = () => {
               console.error("capture server error:", data.error);
               return;
             }
-            const raw = data.raw || "";
-            const lengthFromRaw = raw
-              ? Math.ceil(raw.replace(/\s+/g, "").length / 2)
-              : 0;
+            // Accept multiple payload shapes from server
+            const rawInput =
+              data.raw ?? data.data ?? data.payload ?? data.bytes ?? "";
+            const rawHex = toHexFromUnknown(rawInput);
+            const lengthFromRaw = rawHex ? Math.ceil(rawHex.length / 2) : 0;
             const proto = getPrimaryProtocol(data.protocol || "");
             const pkt = {
               id: data.id != null ? Number(data.id) : packetId.current++,
@@ -567,14 +646,14 @@ const NetSpector = () => {
               timestamp: data.timestamp || Date.now(),
               source: data.source || data.src || "",
               destination: data.destination || data.dst || "",
-              protocol: proto || (raw ? "RAW" : ""),
+              protocol: proto || (rawHex ? "RAW" : ""),
               length: data.length || lengthFromRaw || 0,
               info: data.info || "",
               hexData:
                 data.hexData && data.hexData.length
                   ? data.hexData
-                  : convertRawToLines(raw),
-              raw: raw,
+                  : convertRawToLines(rawHex),
+              raw: rawHex,
               details: data.details || {},
             };
             setPackets((prev) => {
@@ -710,28 +789,147 @@ const NetSpector = () => {
 
   const detailsForRender = selectedPacket ? buildDetails(selectedPacket) : {};
 
+  // Build concise Info column text from provided details
+  const buildRowInfo = (pkt: any) => {
+    try {
+      const d = pkt?.details || {};
+
+      // DNS query summary
+      if (d.dns?.fields && Array.isArray(d.dns.fields)) {
+        const q = d.dns.fields.find((f: string) => f.startsWith("Query:"));
+        if (q) return `DNS ${q}`; // e.g., "DNS Query: example.com"
+      }
+
+      // HTTP summary
+      if (d.http?.fields && Array.isArray(d.http.fields)) {
+        const method = d.http.fields.find((f: string) =>
+          f.toLowerCase().startsWith("method:")
+        );
+        const uri = d.http.fields.find((f: string) =>
+          f.toLowerCase().startsWith("uri:")
+        );
+        if (method || uri) {
+          const m = method ? method.split(": ")[1] : "";
+          const u = uri ? uri.split(": ")[1] : "";
+          return `HTTP ${m} ${u}`.trim();
+        }
+      }
+
+      // TCP summary with flags
+      if (d.tcp?.fields && Array.isArray(d.tcp.fields)) {
+        const sp = d.tcp.fields.find((f: string) =>
+          f.toLowerCase().startsWith("source port:")
+        );
+        const dp = d.tcp.fields.find((f: string) =>
+          f.toLowerCase().startsWith("destination port:")
+        );
+        const fl = d.tcp.fields.find((f: string) =>
+          f.toLowerCase().startsWith("flags:")
+        );
+        const srcPort = sp ? sp.split(": ")[1] : "";
+        const dstPort = dp ? dp.split(": ")[1] : "";
+
+        let flagsLabel = "";
+        if (fl) {
+          const val = fl.split(": ")[1] || "";
+          if (/^0x/i.test(val)) {
+            const n = parseInt(val, 16);
+            const bits: string[] = [];
+            if (n & 0x01) bits.push("FIN");
+            if (n & 0x02) bits.push("SYN");
+            if (n & 0x04) bits.push("RST");
+            if (n & 0x08) bits.push("PSH");
+            if (n & 0x10) bits.push("ACK");
+            if (n & 0x20) bits.push("URG");
+            if (n & 0x40) bits.push("ECE");
+            if (n & 0x80) bits.push("CWR");
+            if (bits.length) flagsLabel = `[${bits.join(", ")}]`;
+          } else if (val) {
+            flagsLabel = val.startsWith("[") ? val : `[${val}]`;
+          }
+        }
+
+        if (srcPort || dstPort || flagsLabel) {
+          return `${srcPort} → ${dstPort} ${flagsLabel}`.trim();
+        }
+      }
+
+      // UDP summary
+      if (d.udp?.fields && Array.isArray(d.udp.fields)) {
+        const sp = d.udp.fields.find((f: string) =>
+          f.toLowerCase().startsWith("source port:")
+        );
+        const dp = d.udp.fields.find((f: string) =>
+          f.toLowerCase().startsWith("destination port:")
+        );
+        const srcPort = sp ? sp.split(": ")[1] : "";
+        const dstPort = dp ? dp.split(": ")[1] : "";
+        if (srcPort || dstPort) return `${srcPort} → ${dstPort}`.trim();
+      }
+
+      // Fallback to provided info or empty
+      return pkt.info || "";
+    } catch (e) {
+      return pkt?.info || "";
+    }
+  };
+
+  const getSectionIcon = (key: string) => {
+    switch (key) {
+      case "frame":
+        return { Icon: Info, className: "text-blue-600" };
+      case "ethernet":
+        return { Icon: Activity, className: "text-gray-600" };
+      case "ipv4":
+      case "ipv6":
+        return { Icon: Network, className: "text-green-600" };
+      case "tcp":
+        return { Icon: Settings, className: "text-red-600" };
+      case "udp":
+        return { Icon: Settings, className: "text-indigo-600" };
+      case "dns":
+      case "mdns":
+        return { Icon: Search, className: "text-purple-600" };
+      case "application":
+        return { Icon: Database, className: "text-teal-600" };
+      default:
+        return { Icon: Info, className: "text-gray-500" };
+    }
+  };
+
   return (
-    <div className="h-screen flex flex-col bg-gradient-to-br from-gray-50 to-gray-100">
-      {/* Welcome Modal */}
+    <div className="min-h-screen flex flex-col bg-gray-100">
+      {/* Welcome Overlay */}
       {showWelcome && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-          <div className="bg-white rounded-lg p-8 max-w-2xl shadow-2xl">
-            <div className="flex items-center gap-4 mb-6">
-              <Wifi className="w-10 h-10 text-blue-600" />
-              <h2 className="text-3xl font-bold">NetSpector</h2>
-            </div>
-            <p className="text-lg mb-6">
-              Browser-based Wireshark-like Network Analyzer
-            </p>
-            <div className="bg-blue-50 p-4 rounded mb-6">
-              <p className="text-sm">
-                To receive real packets enable <strong>Use Live Capture</strong>{" "}
-                and run the local capture server (tshark).
+        <div className="fixed inset-0 bg-gradient-to-br from-blue-50 to-purple-50 flex items-center justify-center z-50">
+          <div className="bg-white rounded-xl shadow-2xl p-8 max-w-2xl mx-4">
+            <div className="mb-6 text-center">
+              <div className="flex items-center justify-center gap-3 mb-3">
+                <Wifi className="w-8 h-8 text-blue-500" />
+                <h2 className="text-2xl font-bold">Welcome to NetSpector</h2>
+              </div>
+              <p className="text-gray-600">
+                Capture and inspect network traffic in real time.
               </p>
             </div>
+
+            <div className="space-y-4 text-gray-700">
+              <div className="flex items-start gap-3">
+                <Info className="w-5 h-5 text-blue-500 mt-0.5" />
+                <p>
+                  Enable <strong>Use Live Capture</strong> in Settings and start
+                  the capture.
+                </p>
+              </div>
+              <div className="flex items-start gap-3">
+                <Database className="w-5 h-5 text-green-500 mt-0.5" />
+                <p>Click any row to view protocol details and hex.</p>
+              </div>
+            </div>
+
             <button
               onClick={() => setShowWelcome(false)}
-              className="w-full bg-blue-600 text-white py-3 rounded-lg font-bold hover:bg-blue-700"
+              className="w-full mt-6 bg-blue-600 text-white py-3 rounded-lg font-bold hover:bg-blue-700"
             >
               Start Exploring
             </button>
@@ -1113,7 +1311,9 @@ const NetSpector = () => {
                   <td className="px-4 py-2 text-right font-mono">
                     {packet.length}
                   </td>
-                  <td className="px-4 py-2 text-gray-700">{packet.info}</td>
+                  <td className="px-4 py-2 text-gray-700">
+                    {buildRowInfo(packet)}
+                  </td>
                 </tr>
               ))}
               <tr ref={listEndRef}>
@@ -1192,6 +1392,45 @@ const NetSpector = () => {
                   </div>
                 </div>
 
+                {/* Controls */}
+                <div className="flex items-center justify-between mb-3">
+                  <div className="text-xs text-gray-500">
+                    Sections: {Object.keys(detailsForRender ?? {}).length}
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() => setExpandAll((v) => !v)}
+                      className={`px-3 py-1 text-xs rounded border ${
+                        expandAll
+                          ? "bg-blue-600 border-blue-700 text-white"
+                          : "bg-gray-100 border-gray-300 text-gray-800"
+                      }`}
+                      title={expandAll ? "Collapse All" : "Expand All"}
+                    >
+                      {expandAll ? "Collapse All" : "Expand All"}
+                    </button>
+                    <button
+                      onClick={() => setShowRawJson((v) => !v)}
+                      className={`px-3 py-1 text-xs rounded border ${
+                        showRawJson
+                          ? "bg-purple-600 border-purple-700 text-white"
+                          : "bg-gray-100 border-gray-300 text-gray-800"
+                      }`}
+                    >
+                      {showRawJson ? "Hide Raw JSON" : "Show Raw JSON"}
+                    </button>
+                  </div>
+                </div>
+
+                {/* Raw JSON */}
+                {showRawJson && (
+                  <div className="mb-4 p-3 bg-gray-50 border rounded">
+                    <pre className="text-xs overflow-auto max-h-64">
+                      {JSON.stringify(selectedPacket.details || {}, null, 2)}
+                    </pre>
+                  </div>
+                )}
+
                 {/* Protocol Details */}
                 <div className="mt-4">
                   {Object.keys(detailsForRender ?? {}).length > 0 ? (
@@ -1201,9 +1440,22 @@ const NetSpector = () => {
                     >
                       {Object.entries(detailsForRender).map(
                         ([key, section]) => (
-                          <details key={key} className="border rounded">
+                          <details
+                            key={key}
+                            className="border rounded"
+                            open={expandAll}
+                          >
                             <summary className="px-4 py-2 bg-gray-100 cursor-pointer font-semibold flex justify-between items-center">
-                              <span>{section.title}</span>
+                              <span className="flex items-center gap-2">
+                                {(() => {
+                                  const { Icon, className } =
+                                    getSectionIcon(key);
+                                  return (
+                                    <Icon className={`w-4 h-4 ${className}`} />
+                                  );
+                                })()}
+                                <span className="sr-only">{section.title}</span>
+                              </span>
 
                               {Array.isArray(section.fields) && (
                                 <span className="text-xs text-gray-500">
@@ -1217,25 +1469,42 @@ const NetSpector = () => {
                                 {Array.isArray(section.fields) &&
                                   section.fields.map((field, i) => {
                                     const [label, ...rest] = field.split(": ");
+                                    const value = rest.join(": ");
 
                                     return rest.length ? (
                                       <div
                                         key={i}
-                                        className="flex justify-between gap-4"
+                                        className="grid grid-cols-12 items-center gap-3"
                                       >
-                                        <span className="text-gray-700 font-medium">
+                                        <span className="col-span-4 text-gray-700 font-medium truncate">
                                           {label}
                                         </span>
-                                        <span className="font-mono text-blue-700 text-right">
-                                          {rest.join(": ")}
+                                        <span className="col-span-7 font-mono text-blue-700 truncate">
+                                          {value}
                                         </span>
+                                        <button
+                                          className="col-span-1 text-xs px-2 py-1 bg-gray-100 border rounded hover:bg-gray-200"
+                                          onClick={() =>
+                                            copyText(value || field)
+                                          }
+                                        >
+                                          Copy
+                                        </button>
                                       </div>
                                     ) : (
                                       <div
                                         key={i}
-                                        className="font-mono text-gray-700"
+                                        className="flex items-center justify-between gap-3"
                                       >
-                                        {field}
+                                        <span className="font-mono text-gray-700 truncate">
+                                          {field}
+                                        </span>
+                                        <button
+                                          className="text-xs px-2 py-1 bg-gray-100 border rounded hover:bg-gray-200"
+                                          onClick={() => copyText(field)}
+                                        >
+                                          Copy
+                                        </button>
                                       </div>
                                     );
                                   })}
@@ -1273,32 +1542,42 @@ const NetSpector = () => {
                     Hex View ({selectedPacket.length} bytes)
                   </span>
                 </div>
-                {(selectedPacket.hexData && selectedPacket.hexData.length > 0
-                  ? selectedPacket.hexData
-                  : convertRawToLines(selectedPacket.raw)
-                ).map((line: string, idx: number) => (
-                  <div
-                    key={idx}
-                    className="hover:bg-gray-800 py-1 px-3 rounded"
-                  >
-                    <span className="text-gray-500 select-none mr-4">
-                      {(idx * 16).toString(16).padStart(4, "0")}
-                    </span>
-                    <span className="mr-8">{line}</span>
-                    <span className="text-blue-400">
-                      {line
-                        .split(" ")
-                        .map((b) =>
-                          b
-                            ? parseInt(b, 16) >= 32 && parseInt(b, 16) <= 126
-                              ? String.fromCharCode(parseInt(b, 16))
-                              : "."
-                            : ""
-                        )
-                        .join("")}
-                    </span>
-                  </div>
-                ))}
+                {(() => {
+                  const lines =
+                    selectedPacket.hexData && selectedPacket.hexData.length > 0
+                      ? selectedPacket.hexData
+                      : convertRawToLines(selectedPacket.raw);
+                  if (!lines || lines.length === 0) {
+                    return (
+                      <div className="text-gray-400">
+                        No payload available to render.
+                      </div>
+                    );
+                  }
+                  return lines.map((line: string, idx: number) => (
+                    <div
+                      key={idx}
+                      className="hover:bg-gray-800 py-1 px-3 rounded"
+                    >
+                      <span className="text-gray-500 select-none mr-4">
+                        {(idx * 16).toString(16).padStart(4, "0")}
+                      </span>
+                      <span className="mr-8">{line}</span>
+                      <span className="text-blue-400">
+                        {line
+                          .split(" ")
+                          .map((b) =>
+                            b
+                              ? parseInt(b, 16) >= 32 && parseInt(b, 16) <= 126
+                                ? String.fromCharCode(parseInt(b, 16))
+                                : "."
+                              : ""
+                          )
+                          .join("")}
+                      </span>
+                    </div>
+                  ));
+                })()}
               </div>
             ) : (
               <div className="flex items-center justify-center h-full text-gray-500">
